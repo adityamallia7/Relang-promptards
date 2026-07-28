@@ -2,35 +2,39 @@
 // the reLang hackathon's HTTP-replay test suite (relang/input, relang/output).
 //
 // Design notes:
-//  - Single-process, in-memory data store (mutex-guarded). The test harness
-//    calls GET /__test/reset/ before every test case, so nothing needs to
-//    survive across test cases and a database is unnecessary.
+//  - Single-threaded, in-memory data store (one request handled at a time,
+//    so no locking is needed). The test harness calls GET /__test/reset/
+//    before every test case, so nothing needs to survive across test cases
+//    and a database is unnecessary.
+//  - No external dependencies beyond the C++ standard library and platform
+//    sockets (see json_lite.h/http_lite.h/optional_lite.h) -- this avoids
+//    needing Drogon, jsoncpp, or any of Drogon's transitive cmake
+//    requirements (MySQL/PostgreSQL/Redis/Brotli dev packages), so the
+//    program builds with a single `g++` invocation on Linux or Windows.
 //  - Only status code, content-type, and (for JSON/text bodies) body content
 //    are compared by the harness; HTML/SVG bodies are never compared. This
 //    lets us skip the Django template/HTML layer entirely for the endpoints
 //    exercised by relang/input/*.json (all under api/, ping/, badge/, b/).
 //  - JSON field names/values mirror hc/api/models.py Check.to_dict(),
 //    Ping.to_dict(), Channel.to_dict(), Flip.to_dict() exactly.
-#include <drogon/drogon.h>
-#include <json/json.h>
 #include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <map>
-#include <mutex>
-#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "optional_lite.h"
+#include "json_lite.h"
+#include "http_lite.h"
 #include "tz_data.h"
 
-using namespace drogon;
-using Clock = std::chrono::system_clock;
-using TimePoint = Clock::time_point;
+typedef std::chrono::system_clock Clock;
+typedef Clock::time_point TimePoint;
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -101,12 +105,10 @@ static std::string slugify(const std::string &name) {
 
 static std::string isoformatUtc(const TimePoint &tp) {
     auto t = Clock::to_time_t(tp);
-    std::tm tmv{};
-#if defined(_WIN32)
-    gmtime_s(&tmv, &t);
-#else
-    gmtime_r(&t, &tmv);
-#endif
+    // Not thread-safe, but the server is single-threaded (one request
+    // handled at a time), and this avoids gmtime_s (MSVC CRT-only, not
+    // declared by older MinGW toolchains) / gmtime_r (POSIX-only) entirely.
+    std::tm tmv = *std::gmtime(&t);
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+00:00", tmv.tm_year + 1900,
                   tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
@@ -255,8 +257,8 @@ struct PingRec {
     std::string method;
     std::string ua;
     std::string body;
-    std::optional<std::string> rid;
-    std::optional<int> exitstatus;
+    Optional<std::string> rid;
+    Optional<int> exitstatus;
 };
 
 struct Check {
@@ -273,10 +275,10 @@ struct Check {
     bool manualResume = false;
     std::string badgeKey;
     int nPings = 0;
-    std::optional<TimePoint> lastPing;
-    std::optional<TimePoint> lastStart;
-    std::optional<std::string> lastStartRid;
-    std::optional<long long> lastDurationS;
+    Optional<TimePoint> lastPing;
+    Optional<TimePoint> lastStart;
+    Optional<std::string> lastStartRid;
+    Optional<long long> lastDurationS;
     std::string status = "new";  // new/up/down/paused
     std::vector<PingRec> pings;
     std::set<std::string> channelCodes;
@@ -307,10 +309,10 @@ struct Check {
         return "up";
     }
 
-    std::optional<TimePoint> nextPing() const {
+    Optional<TimePoint> nextPing() const {
         if (kind == "simple" && status == "up" && lastPing)
             return *lastPing + std::chrono::seconds(timeoutS);
-        return std::nullopt;
+        return Optional<TimePoint>();
     }
 
     std::string channelsStr() const {
@@ -340,13 +342,11 @@ struct Project {
     int pingLogLimit = 100;
 };
 
-static std::mutex g_mu;
 static Project g_project;
 static std::map<std::string, Check> g_checks;   // key = code
 static std::vector<Channel> g_channels;
 
 static void resetState() {
-    std::lock_guard<std::mutex> lock(g_mu);
     g_project = Project();
     g_checks.clear();
     g_channels.clear();
@@ -486,7 +486,6 @@ static AuthResult authorize(const HttpRequestPtr &req, const Json::Value &jsonBo
         r.errResp = errorResponse("missing api key", k401Unauthorized);
         return r;
     }
-    std::lock_guard<std::mutex> lock(g_mu);
     if (apiKey == g_project.apiKey) {
         r.ok = true;
         r.readonly = false;
@@ -506,27 +505,27 @@ static AuthResult authorize(const HttpRequestPtr &req, const Json::Value &jsonBo
 // ---------------------------------------------------------------------------
 
 struct Spec {
-    std::optional<std::string> channels;
-    std::optional<std::string> desc;
-    std::optional<std::string> failureKw;
-    std::optional<bool> filterSubject;
-    std::optional<bool> filterBody;
-    std::optional<bool> filterHttpBody;
-    std::optional<bool> filterDefaultFail;
-    std::optional<long long> grace;
-    std::optional<bool> manualResume;
-    std::optional<std::string> methods;
-    std::optional<std::string> name;
-    std::optional<std::string> schedule;
-    std::optional<std::string> slug;
-    std::optional<std::string> startKw;
-    std::optional<std::string> subject;
-    std::optional<std::string> subjectFail;
-    std::optional<std::string> successKw;
-    std::optional<std::string> tags;
-    std::optional<long long> timeout;
-    std::optional<std::string> tz;
-    std::optional<std::vector<std::string>> unique;
+    Optional<std::string> channels;
+    Optional<std::string> desc;
+    Optional<std::string> failureKw;
+    Optional<bool> filterSubject;
+    Optional<bool> filterBody;
+    Optional<bool> filterHttpBody;
+    Optional<bool> filterDefaultFail;
+    Optional<long long> grace;
+    Optional<bool> manualResume;
+    Optional<std::string> methods;
+    Optional<std::string> name;
+    Optional<std::string> schedule;
+    Optional<std::string> slug;
+    Optional<std::string> startKw;
+    Optional<std::string> subject;
+    Optional<std::string> subjectFail;
+    Optional<std::string> successKw;
+    Optional<std::string> tags;
+    Optional<long long> timeout;
+    Optional<std::string> tz;
+    Optional<std::vector<std::string>> unique;
 
     std::string kind() const {
         if (schedule) return guessKind(*schedule);
@@ -537,7 +536,15 @@ struct Spec {
 
 // Returns error message ("json validation error: ...") or empty string if OK.
 static std::string validateAndBuildSpec(const Json::Value &body, Spec &spec) {
-    auto isNull = [&](const char *k) { return !body.isMember(k) || body[k].isNull(); };
+    // NOTE: only checks *absence*, not JSON null. The Python reference
+    // (hc/api/views.py Spec.check_nulls) converts any explicit null in the
+    // request into a float sentinel that then fails every field's type
+    // check (none of the fields are float-typed) -- so an explicit null
+    // must still be rejected as a type error, not silently skipped like an
+    // absent key. Our Json::Value.isString()/isBool()/isInt()/isArray() all
+    // correctly return false for a null value, so simply not skipping here
+    // reproduces that behavior for free.
+    auto isNull = [&](const char *k) { return !body.isMember(k); };
     auto errStr = [](const std::string &field, const std::string &msg) {
         return "json validation error: " + field + " " + msg;
     };
@@ -562,7 +569,7 @@ static std::string validateAndBuildSpec(const Json::Value &body, Spec &spec) {
     // filter_subject / filter_body / filter_http_body / filter_default_fail
     struct BF {
         const char *key;
-        std::optional<bool> Spec::*field;
+        Optional<bool> Spec::*field;
     };
     std::vector<BF> boolFields{{"filter_subject", &Spec::filterSubject},
                                {"filter_body", &Spec::filterBody},
@@ -627,7 +634,7 @@ static std::string validateAndBuildSpec(const Json::Value &body, Spec &spec) {
     struct SF {
         const char *key;
         int maxLen;
-        std::optional<std::string> Spec::*field;
+        Optional<std::string> Spec::*field;
     };
     for (auto &sf : std::vector<SF>{{"start_kw", 200, &Spec::startKw},
                                       {"subject", 200, &Spec::subject},
@@ -788,8 +795,8 @@ static bool matchKeywords(const std::string &haystack, const std::string &keywor
 
 static void doPing(Check &check, const std::string &remoteAddr, const std::string &scheme,
                     const std::string &method, const std::string &ua, const std::string &body,
-                    std::string action, const std::optional<std::string> &rid,
-                    std::optional<int> exitstatus) {
+                    std::string action, const Optional<std::string> &rid,
+                    Optional<int> exitstatus) {
     auto now = Clock::now();
     if (check.status == "paused" && check.manualResume) action = "ign";
 
@@ -839,7 +846,7 @@ static Json::Value parseJsonBodyOrNull(const HttpRequestPtr &req) {
     Json::CharReaderBuilder rb;
     Json::Value root;
     std::string errs;
-    std::istringstream iss(std::string(body));
+    std::istringstream iss(body);
     if (!Json::parseFromStream(rb, iss, &root, &errs)) return Json::Value();  // invalid marker
     return root;
 }
@@ -847,11 +854,10 @@ static Json::Value parseJsonBodyOrNull(const HttpRequestPtr &req) {
 static void handlePingRoute(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&callback,
                              const std::vector<std::string> &segs) {
     // segs[0] == "ping"
-    std::lock_guard<std::mutex> lock(g_mu);
     std::string first = segs.size() > 1 ? segs[1] : "";
     Check *check = nullptr;
     std::string action = "success";
-    std::optional<int> exitstatus;
+    Optional<int> exitstatus;
     bool createdNow = false;
 
     auto methodStr = [&]() {
@@ -961,7 +967,7 @@ static void handlePingRoute(const HttpRequestPtr &req, std::function<void(const 
             action = "ign";
     }
 
-    std::optional<std::string> rid;
+    Optional<std::string> rid;
     auto qs = parseQuery(req->query());
     auto ridIt = qs.find("rid");
     if (ridIt != qs.end()) {
@@ -989,7 +995,6 @@ static void handlePingRoute(const HttpRequestPtr &req, std::function<void(const 
 static void handleBadgeRoute(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&callback,
                               const std::vector<std::string> &segs) {
     // /badge/<key>/<sig>/<tag>.<fmt>  or  /badge/<key>/<sig>.<fmt>
-    std::lock_guard<std::mutex> lock(g_mu);
     if (segs.size() < 3) {
         callback(emptyStatus(k404NotFound));
         return;
@@ -1033,11 +1038,10 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 auto qs = parseQuery(req->query());
                 std::set<std::string> tags;
                 for (auto it = qs.lower_bound("tag"); it != qs.upper_bound("tag"); ++it) tags.insert(it->second);
-                std::optional<std::string> slugFilter;
+                Optional<std::string> slugFilter;
                 auto slugIt = qs.find("slug");
                 if (slugIt != qs.end()) slugFilter = slugIt->second;
 
@@ -1075,7 +1079,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 Json::Value effectiveBody = bodyJson.isNull() ? Json::Value(Json::objectValue) : bodyJson;
                 Spec spec;
                 std::string err = validateAndBuildSpec(effectiveBody, spec);
@@ -1124,7 +1127,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                         callback(auth.errResp);
                         return;
                     }
-                    std::lock_guard<std::mutex> lock(g_mu);
                     auto it = g_checks.find(code);
                     if (it == g_checks.end()) {
                         callback(emptyStatus(k404NotFound));
@@ -1146,7 +1148,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                         callback(auth.errResp);
                         return;
                     }
-                    std::lock_guard<std::mutex> lock(g_mu);
                     auto it = g_checks.find(code);
                     if (it == g_checks.end()) {
                         callback(emptyStatus(k404NotFound));
@@ -1172,7 +1173,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                         callback(auth.errResp);
                         return;
                     }
-                    std::lock_guard<std::mutex> lock(g_mu);
                     auto it = g_checks.find(code);
                     if (it == g_checks.end()) {
                         callback(emptyStatus(k404NotFound));
@@ -1198,7 +1198,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 auto it = g_checks.find(code);
                 if (it == g_checks.end()) {
                     callback(emptyStatus(k404NotFound));
@@ -1223,7 +1222,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 auto it = g_checks.find(code);
                 if (it == g_checks.end()) {
                     callback(emptyStatus(k404NotFound));
@@ -1251,7 +1249,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 auto it = g_checks.find(code);
                 if (it == g_checks.end()) {
                     callback(emptyStatus(k404NotFound));
@@ -1302,7 +1299,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
                     callback(auth.errResp);
                     return;
                 }
-                std::lock_guard<std::mutex> lock(g_mu);
                 auto it = g_checks.find(code);
                 if (it == g_checks.end()) {
                     callback(emptyStatus(k404NotFound));
@@ -1328,7 +1324,6 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
             callback(auth.errResp);
             return;
         }
-        std::lock_guard<std::mutex> lock(g_mu);
         Json::Value arr(Json::arrayValue);
         for (auto &ch : g_channels) {
             Json::Value j(Json::objectValue);
@@ -1389,46 +1384,43 @@ static void handleApiRoute(const HttpRequestPtr &req, std::function<void(const H
     callback(emptyStatus(k404NotFound));
 }
 
+static void dispatch(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&callback) {
+    std::string path = req->path();
+
+    if (path == "/__test/reset/" || path == "/__test/reset") {
+        resetState();
+        callback(plainResponse("OK", k200OK));
+        return;
+    }
+
+    std::vector<std::string> segs = splitPath(path);
+
+    if (!segs.empty() && segs[0] == "ping") {
+        handlePingRoute(req, std::move(callback), segs);
+        return;
+    }
+    if (!segs.empty() && segs[0] == "badge") {
+        handleBadgeRoute(req, std::move(callback), segs);
+        return;
+    }
+    if (!segs.empty() && segs[0] == "b") {
+        handleCheckBadgeRoute(req, std::move(callback), segs);
+        return;
+    }
+    if (segs.size() >= 2 && segs[0] == "api" && segs[1].size() == 2 && segs[1][0] == 'v' &&
+        std::isdigit(static_cast<unsigned char>(segs[1][1]))) {
+        int version = segs[1][1] - '0';
+        std::vector<std::string> rest(segs.begin() + 2, segs.end());
+        handleApiRoute(req, std::move(callback), version, rest);
+        return;
+    }
+
+    callback(emptyStatus(k404NotFound));
+}
+
 int main() {
-    LOG_INFO << "Starting healthchecks C++ port on 0.0.0.0:8000";
-
-    drogon::app().setDefaultHandler(
-        [](const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&callback) {
-            std::string path = req->path();
-
-            if (path == "/__test/reset/" || path == "/__test/reset") {
-                resetState();
-                callback(plainResponse("OK", k200OK));
-                return;
-            }
-
-            auto segs = splitPath(path);
-
-            if (!segs.empty() && segs[0] == "ping") {
-                handlePingRoute(req, std::move(callback), segs);
-                return;
-            }
-            if (!segs.empty() && segs[0] == "badge") {
-                handleBadgeRoute(req, std::move(callback), segs);
-                return;
-            }
-            if (!segs.empty() && segs[0] == "b") {
-                handleCheckBadgeRoute(req, std::move(callback), segs);
-                return;
-            }
-            if (segs.size() >= 2 && segs[0] == "api" && segs[1].size() == 2 && segs[1][0] == 'v' &&
-                std::isdigit(static_cast<unsigned char>(segs[1][1]))) {
-                int version = segs[1][1] - '0';
-                std::vector<std::string> rest(segs.begin() + 2, segs.end());
-                handleApiRoute(req, std::move(callback), version, rest);
-                return;
-            }
-
-            callback(emptyStatus(k404NotFound));
-        });
-
-    drogon::app().addListener("0.0.0.0", 8000);
-    drogon::app().setThreadNum(4);
-    drogon::app().run();
+    std::printf("Starting healthchecks C++ port on 0.0.0.0:8000\n");
+    std::fflush(stdout);
+    runHttpServer(8000, &dispatch);
     return 0;
 }

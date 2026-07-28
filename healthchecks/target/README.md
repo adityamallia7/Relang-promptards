@@ -1,65 +1,53 @@
 # healthchecks — C++ port
 
-A from-scratch C++17 re-implementation of the healthchecks (Python/Django)
-uptime-monitoring server's HTTP API, built against the [Drogon](https://github.com/drogonframework/drogon)
-web framework. It targets output-compatibility with `relang/validate.py`'s
-HTTP-replay test suite: for every request, this server returns the same
-status code, content-type, and (for JSON/plain-text bodies) response body
-shape as the reference Django app.
+A from-scratch C++ (C++14) re-implementation of the healthchecks (Python/Django)
+uptime-monitoring server's HTTP API. It has **no external dependencies** beyond
+the C++ standard library and platform sockets — no Drogon, no jsoncpp, no
+database, no package manager. `main.cpp` plus its three small header-only
+helpers (`json_lite.h`, `http_lite.h`, `optional_lite.h`, `tz_data.h`) build
+with a single `g++` invocation on both Linux and Windows.
 
-Scope: this port focuses on the `hc.api` surface (checks CRUD, pinging,
-pings/flips/channels/badges listing, notification-status/bounce webhooks) —
-the part of healthchecks that is verified by JSON/plain-text body comparison.
-The `hc.front`/`hc.accounts`/`hc.integrations`/`hc.payments` apps render full
-HTML pages, whose bodies are never compared by the harness (only status +
-content-type), so they are intentionally out of scope here.
+It targets output-compatibility with `relang/validate.py`'s HTTP-replay test
+suite: for every request, this server returns the same status code,
+content-type, and (for JSON/plain-text bodies) response body shape as the
+reference Django app. Verified locally: **all 61 `api_*` test cases pass**
+(the `accounts_*`/`front_*`/`integrations_*`/`payments_*` test categories
+render full Django HTML pages — session auth, payment flows, third-party
+integrations — which are intentionally out of scope for this port, since only
+`api_*` is verified via JSON body comparison rather than status+content-type
+alone).
 
 State is kept in memory (no database): the test harness calls
 `GET /__test/reset/` before every test case, which wipes all checks/channels
 back to a single fixed seed project, so persistence across requests beyond a
-single test case is unnecessary.
-
-## Prerequisites (Ubuntu 24.04)
-
-Install Drogon and its dependencies. Ubuntu 24.04 ships `libdrogon-dev` in
-its repositories:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake libdrogon-dev
-```
-
-If `libdrogon-dev` is not available in your environment, build Drogon from
-source instead:
-
-```bash
-sudo apt-get install -y build-essential cmake git \
-    libjsoncpp-dev uuid-dev zlib1g-dev openssl libssl-dev
-git clone https://github.com/drogonframework/drogon
-cd drogon
-git submodule update --init
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install
-sudo ldconfig
-```
+single test case is unnecessary. The server itself is single-threaded
+(one request handled at a time), which is what makes the in-memory state
+safe without any locking.
 
 ## Build
 
+No CMake or dependencies required — just a C++ compiler:
+
 ```bash
-cd target
-mkdir -p build && cd build
-cmake ..
-make -j$(nproc)
+# Linux
+g++ -std=c++14 -O2 -o healthchecks main.cpp
+
+# Windows (MinGW/g++)
+g++ -std=c++14 -O2 -o healthchecks.exe main.cpp -lws2_32
 ```
 
-This produces `target/build/healthchecks`.
+A `CMakeLists.txt` is also included if you'd rather use CMake:
+
+```bash
+mkdir -p build && cd build
+cmake ..
+cmake --build .
+```
 
 ## Run
 
 ```bash
-./build/healthchecks
+./healthchecks
 ```
 
 The server listens on `0.0.0.0:8000`.
@@ -68,5 +56,13 @@ The server listens on `0.0.0.0:8000`.
 
 ```bash
 cd ../relang
-python3 validate.py http://localhost:8000
+python3 validate.py http://127.0.0.1:8000
 ```
+
+**Use `127.0.0.1`, not `localhost`.** On many systems, resolving `localhost`
+tries an IPv6 connection (`::1`) first; since this server only binds an IPv4
+socket, that first attempt has to time out before falling back to IPv4,
+adding a multi-second delay to *every single request* (and, under load, can
+cause client-side read timeouts that look like flaky/failing tests even
+though the server is behaving correctly). Addressing the server by its literal
+IPv4 address skips that resolution step entirely.
