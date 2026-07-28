@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 monocypher_cli.py — Python twin of monocypher-cli.c.
 
