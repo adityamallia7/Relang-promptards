@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 asciiquarium.py - a Python port of the Perl `asciiquarium` (Term::Animation) program.
 
