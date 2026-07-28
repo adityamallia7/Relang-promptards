@@ -14,7 +14,7 @@ def main() -> int:
         sys.stderr.write("node not found in PATH\n")
         return 1
 
-    data = sys.stdin.buffer.read().decode("utf-8")
+    data = sys.stdin.buffer.read()
     module_url = marked_js.resolve().as_uri() if hasattr(marked_js, "resolve") else str(marked_js)
     js_code = """
 const { readFileSync } = require('node:fs');
@@ -29,13 +29,11 @@ const { readFileSync } = require('node:fs');
         [node, "-e", js_code, module_url],
         input=data,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
     if result.stdout:
-        sys.stdout.write(result.stdout)
+        sys.stdout.buffer.write(result.stdout)
     if result.stderr:
-        sys.stderr.write(result.stderr)
+        sys.stderr.buffer.write(result.stderr)
     return result.returncode
 
 
